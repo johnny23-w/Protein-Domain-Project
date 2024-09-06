@@ -1,0 +1,279 @@
+import os
+import csv
+import math
+import numpy as np
+import torch
+import torch.nn as nn
+import pandas as pd
+import random
+import matplotlib.pyplot as plt
+import h5py
+from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, Dataset
+from torch.optim import Adam, AdamW
+from torch.nn import BCEWithLogitsLoss
+from random import shuffle
+from torch.utils.data import Sampler
+from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score, matthews_corrcoef, average_precision_score
+from tqdm import tqdm
+import argparse
+
+def create_parser():
+    parser = argparse.ArgumentParser(description='trains a neural network on ProtTrans embeddings')
+
+    parser.add_argument('-model_checkpoint', metavar='--model_checkpoint', type=str, help='full path to model checkpoint file')
+
+    parser.add_argument('-valid_embedding_file', metavar='--valid_embedding_file', type=str, help='enter full path to directory containing validation embeddings')
+    parser.add_argument('-valid_annotation_file', metavar='--valid_annotation_file', type=str, help='enter path to annotation validation file')
+
+    parser.add_argument('-kernel_size_1', metavar='--kernel_size_1', type=int, help='short range context block kernel size')
+    parser.add_argument('-kernel_size_2', metavar='--kernel_size_2', type=int, help='long range context block kernel size')
+    parser.add_argument('-num_layers', metavar='--num_layers', type=int, help='number of convolutional layers in each block')
+    parser.add_argument('-num_channels', metavar='--num_channels', type=int, help='number of output channels from convolutional layer')
+    parser.add_argument('-hidden_dim', metavar='--hidden_dim', type=int, help='size of fully connected layer')
+
+    parser.add_argument('-conv_dropout', metavar='--conv_dropout', type=float, help='dropout probability in conv layer')
+    parser.add_argument('-fc_dropout', metavar='--fc_dropout', type=float, help='dropout probability in fully connected network')
+
+    parser.add_argument('-output_dir', metavar='--output_dir', type=str, help='where to save model checkpoints and training plots')
+
+    parser.add_argument('-thresh', metavar='--thresh', type=float, help='thresh')
+
+    return parser
+
+
+def parse_domain(dom_str):
+    dom_list = [[it[0], list(map(int, it[1].split(':')))] for it in (dom.split(';') for dom in dom_str.split('|'))]
+    return dom_list
+
+def dom_list_to_linker_tensor(dom_list_, prot_len):
+    dom_list = [dom for dom in dom_list_ if not ('m' in dom[0])]
+    labels = torch.zeros(prot_len).int()
+    for dom in dom_list:
+        labels[max(dom[1][0]-1-10,0):dom[1][0]-1+11] += 1
+        labels[dom[1][1]-1-10:min(dom[1][1]-1+11, prot_len)] += 1
+    return (labels>0.5).int()
+
+class ProtDomDataset(Dataset):
+    def __init__(self, h5_file, annot_file):
+        self.emb_dict = h5_file
+        self.df = pd.read_csv(annot_file, header=None)
+
+        self.uniprot_ids = self.df[0]
+        self.domain_annot = self.df[1]
+        self.protein_lens = self.df[2]
+        self.n_bounds = self.df[1].apply(lambda l: [dom for dom in parse_domain(l) if 'm' not in dom[0]][0][1][0])
+        self.c_bounds = self.df[1].apply(lambda l: [dom for dom in parse_domain(l) if 'm' not in dom[0]][-1][1][1])
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        length = self.df.iloc[idx, 2]
+        emb = torch.tensor(self.emb_dict[self.uniprot_ids[idx]][:])
+        labels = dom_list_to_linker_tensor(parse_domain(self.df.iloc[idx, 1]), length)
+        n_bound = self.n_bounds.iloc[idx]
+        c_bound = self.c_bounds.iloc[idx]
+        return emb, labels, length, n_bound, c_bound
+
+def collate_fn(batch):
+
+    # batch is list of (embedding, label, length) tuples
+    # embedding is (L,D)-dim tensor, label is (L)-dim tensor and length is scalar
+    embs, lbls, lengths, n_bounds, c_bounds = zip(*batch)
+
+    # sort sequences in descending length
+    sorted_idx = sorted(range(len(lengths)), key=lambda k: -lengths[k])
+
+    # pad sequences
+    padded_seqs = pad_sequence(embs)[:,sorted_idx,:].permute((1,0,2))
+    padded_lbls = pad_sequence(lbls)[:,sorted_idx].permute((1,0))
+    lengths = torch.tensor(lengths)[sorted_idx]
+    n_bounds = torch.tensor(n_bounds)[sorted_idx]
+    c_bounds = torch.tensor(c_bounds)[sorted_idx]
+
+    # prepare mask (mostly for CNN)
+    padding_mask = torch.zeros_like(padded_lbls)
+    for idx, item in enumerate(lengths):
+        padding_mask[idx, :item] = 1
+
+    # padded_seqs is (N,max_L,D)-dim tensor, padded_lbls is (N,max_L)-dim tensor, lengths is N-dim tensor, padding_mask is (N,max_L)-dim tensor
+    return padded_seqs, padded_lbls, lengths, padding_mask, n_bounds, c_bounds
+
+
+class ConvUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, dropout):
+        super().__init__()
+        self.out_channels = out_channels
+        self.conv = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, padding='same')
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout1d(p=dropout)
+      
+    def forward(self, X, mask):
+        '''
+        Input: X: (N,L,C_in)-tensor (float)
+               mask: (N,L)-tensor (int)
+        Output: X_out: (N,L,C_out) - tensor
+        '''
+        X = X.permute((0,2,1))
+        X_out = self.conv(X)
+        X_out = X_out * torch.stack([mask]*self.out_channels).permute((1,0,2))
+        # X_out is (N,C_out,L), LayerNorm requires (N,L,C_out) and Dropout1d requires (N,C_out,L)
+        X_out = self.relu(X_out)
+        X_out = self.dropout(X_out).permute((0,2,1))
+        return X_out
+
+class ConvNet(nn.Module):
+    def __init__(self, kernel_size, num_layers, num_channels, conv_dropout):
+        super().__init__()
+        self.layers = []
+        for i in range(num_layers):
+            if i==0:
+                in_channels=1024
+                out_channels=num_channels
+            else:
+                in_channels = num_channels
+                out_channels = num_channels
+            self.layers.append(ConvUnit(in_channels=in_channels, out_channels=out_channels, kernel_size=kernel_size, dropout=conv_dropout))
+        self.layers = nn.ModuleList(self.layers)
+
+    def forward(self, X, padding_mask):
+        for layer in self.layers:
+            X = layer(X, padding_mask)
+        return X
+
+class Network(nn.Module):
+    def __init__(self, kernel_size_1, kernel_size_2, num_layers, num_channels, hidden_dim, conv_dropout, fc_dropout):
+        super().__init__()
+        self.shortCNN = ConvNet(kernel_size=kernel_size_1, num_layers=num_layers, num_channels=num_channels, conv_dropout=conv_dropout)
+        self.longCNN = ConvNet(kernel_size=kernel_size_2, num_layers=num_layers, num_channels=num_channels, conv_dropout=conv_dropout)
+        self.fc = nn.Sequential(nn.Linear(num_channels*2, hidden_dim),
+                                nn.ReLU(),
+                                nn.Dropout(fc_dropout),
+                                nn.Linear(hidden_dim, 1))
+        
+    def forward(self, X, padding_mask):
+        h_short = self.shortCNN(X, padding_mask)
+        h_long = self.longCNN(X, padding_mask)
+        h = torch.cat((h_short, h_long), dim=2)
+        out = self.fc(h).squeeze(2)
+        return out
+
+
+def eval_fn(model, valid_loader, output_dir, thresh):
+
+    model.eval()
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    model.to(device)
+
+    for idx, batch in enumerate(valid_loader):
+        embs = batch[0].to(device) #N,L,D
+        lbls = batch[1] #N,L
+        lens = batch[2] #N
+        mask = batch[3].to(device) #N,L
+        n_bounds = batch[4] #N
+        c_bounds = batch[5] #N
+
+        with torch.no_grad():
+            outputs = model(embs, mask).to('cpu') #N,L
+            mask = mask.to('cpu') #N,L
+
+            if idx == 0:
+                pred_list = outputs[mask.bool()]
+                lbl_list = lbls[mask.bool()]
+            else:
+                pred_list = torch.cat((pred_list, outputs[mask.bool()]))
+                lbl_list = torch.cat((lbl_list, lbls[mask.bool()]))
+
+            for i in range(len(lens)):
+                if idx == 0 and i == 0:
+                    no_ext_pred_list = outputs[i][mask[i].bool()][n_bounds[i]-1+11:c_bounds[i]-1-10]
+                    no_ext_lbl_list = lbls[i][mask[i].bool()][n_bounds[i]-1+11:c_bounds[i]-1-10]
+                else:
+                    no_ext_pred_list = torch.cat((no_ext_pred_list, outputs[i][mask[i].bool()][n_bounds[i]-1+11:c_bounds[i]-1-10]))
+                    no_ext_lbl_list = torch.cat((no_ext_lbl_list, lbls[i][mask[i].bool()][n_bounds[i]-1+11:c_bounds[i]-1-10]))
+    
+    proba_list = nn.Sigmoid()(pred_list)
+    no_ext_proba_list = nn.Sigmoid()(no_ext_pred_list)
+
+    mets = dict()
+    mets['accuracy'] = accuracy_score(lbl_list, proba_list>thresh)
+    mets['precision'] = precision_score(lbl_list, proba_list>thresh)
+    mets['no_ext_precision'] = precision_score(no_ext_lbl_list, no_ext_proba_list>thresh)
+    mets['recall'] = recall_score(lbl_list, proba_list>thresh)
+    mets['no_ext_recall'] = recall_score(no_ext_lbl_list, no_ext_proba_list>thresh)
+    mets['f1'] = f1_score(lbl_list, proba_list>thresh)
+    mets['no_ext_f1'] = f1_score(no_ext_lbl_list, no_ext_proba_list>thresh)
+    mets['auroc'] = roc_auc_score(lbl_list, proba_list)
+    mets['auprc'] = average_precision_score(lbl_list, proba_list)
+    mets['no_ext_auprc'] = average_precision_score(no_ext_lbl_list, no_ext_proba_list)
+    mets['mcc'] = matthews_corrcoef(lbl_list, proba_list>thresh)
+    mets['no_ext_mcc'] = matthews_corrcoef(no_ext_lbl_list, no_ext_proba_list>thresh)
+    mets['no_ext_precision'] = precision_score(no_ext_lbl_list, no_ext_proba_list>thresh)
+
+    print(f'Precision:{mets["precision"]}, Recall:{mets["recall"]}, F1:{mets["f1"]}, AUPRC:{mets["auprc"]}, MCC:{mets["mcc"]}')
+    print(f'\nNoExtPrecision:{mets["no_ext_precision"]}, NoExtRecall:{mets["no_ext_recall"]}, NoExtF1:{mets["no_ext_f1"]}, NoExtAUPRC:{mets["no_ext_auprc"]}, NoExtMCC:{mets["no_ext_mcc"]}')
+
+    with open(output_dir+'/evals.txt', 'w') as f:
+        f.write(f'Precision:{mets["precision"]}, Recall:{mets["recall"]}, F1:{mets["f1"]}, AUPRC:{mets["auprc"]}, MCC:{mets["mcc"]}\n')
+        f.write(f'\nNoExtPrecision:{mets["no_ext_precision"]}, NoExtRecall:{mets["no_ext_recall"]}, NoExtF1:{mets["no_ext_f1"]}, NoExtAUPRC:{mets["no_ext_auprc"]}, NoExtMCC:{mets["no_ext_mcc"]}')
+
+    return mets
+
+
+def run(args):
+
+    model_checkpoint = args.model_checkpoint
+
+    valid_embedding_file = args.valid_embedding_file
+    valid_annotation_file = args.valid_annotation_file
+
+    kernel_size_1 = args.kernel_size_1
+    kernel_size_2 = args.kernel_size_2
+    num_layers = args.num_layers
+    num_channels = args.num_channels
+    hidden_dim = args.hidden_dim
+
+    conv_dropout = args.conv_dropout
+    fc_dropout = args.fc_dropout
+
+    output_dir = args.output_dir
+
+    thresh = args.thresh
+
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
+
+    with h5py.File(valid_embedding_file) as valid_embs:
+
+        valid_set = ProtDomDataset(h5_file=valid_embs,
+                                    annot_file=valid_annotation_file)
+
+        #train_sampler = BySequenceLengthSampler(train_set.protein_lens, batch_size)
+
+        valid_loader = DataLoader(valid_set, batch_size=1, 
+                        num_workers=4, 
+                        drop_last=False, pin_memory=False, collate_fn=collate_fn)
+    
+        model = Network(kernel_size_1=kernel_size_1,
+                        kernel_size_2=kernel_size_2,
+                        num_layers=num_layers,
+                        num_channels=num_channels,
+                        hidden_dim=hidden_dim,
+                        conv_dropout=conv_dropout,
+                        fc_dropout=fc_dropout)
+        
+        if not model_checkpoint is None:
+            checkpoint = torch.load(model_checkpoint)
+            model.load_state_dict(checkpoint['model'])
+            model.eval()
+
+        eval_fn(model, valid_loader, output_dir, thresh)
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+    run(args)
+
+if __name__ == '__main__':
+    main()
